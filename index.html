@@ -1,0 +1,1485 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#070312">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>ASCII Blumenstrauß</title>
+<style>
+  *, *::before, *::after {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #070312;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100dvh;
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Animierter ASCII-Blumenstrauß"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  /* ============================================================================
+   * 1. RESPONSIVE FULLSCREEN ASCII ENGINE (PHONE, IPAD & DESKTOP)
+   * ============================================================================ */
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  // Offscreen crisp ASCII canvas + downscaled subtle bloom canvas
+  const asciiCv = document.createElement('canvas');
+  const actx = asciiCv.getContext('2d');
+  const bloomCv = document.createElement('canvas');
+  const bctx = bloomCv.getContext('2d');
+
+  // Dynamic viewport & ASCII grid dimensions
+  let vw = window.innerWidth;
+  let vh = window.innerHeight;
+  let DPR = 1;
+  let W = 180;
+  let H = 110;
+  let N = W * H;
+  let CW = 6;
+  let CH = 10;
+  let halfCW = 3;
+  let halfCH = 5;
+
+  // Normalized virtual bouquet coordinate system:
+  //   vx in [-57..+57] (horizontal center = 0)
+  //   vy in [0..124]   (top stems ~2, flowers ~10..74, bow waist = 86, cone tip = 123)
+  const BX = 0;
+  const BY = 86;
+  const CONE_BOT = 123;
+  let pxPerUnit = 5;
+  let originX = vw * 0.5;
+  let originY = 24;
+  let vMinX = -70, vMaxX = 70, vMinY = -10, vMaxY = 135;
+
+  // Flat ASCII framebuffers + reusable color buckets for fast batched draw calls
+  let chBuf = new Array(N);
+  let colBuf = new Array(N);
+  const colorBuckets = new Map();
+  const activeColors = [];
+
+  // Rich ASCII shading ramps (sparse -> dense)
+  const SHADE_RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+  const PETAL_RAMP = " .':;~-=+*#%@";
+  const SOFT_RAMP  = " .'`^,:;~-+*oO0Q#%";
+
+  function resizeEngine() {
+    vw = window.innerWidth;
+    vh = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+    // High-resolution character column density tailored to phone, iPad, and desktop
+    if (vw < 520) {
+      W = Math.round(clamp(vw / 2.55, 140, 184));
+    } else if (vw < 1024) {
+      W = Math.round(clamp(vw / 3.85, 196, 250));
+    } else {
+      W = Math.round(clamp(vw / 5.2, 232, 280));
+    }
+
+    CW = vw / W;
+    const CHAR_ASPECT = 0.60; // monospace width / height ratio
+    CH = CW / CHAR_ASPECT;
+    H = Math.ceil(vh / CH);
+    N = W * H;
+    halfCW = CW * 0.5;
+    halfCH = CH * 0.5;
+
+    // Resize primary and offscreen canvases with capped HiDPI resolution
+    canvas.width = Math.round(vw * DPR);
+    canvas.height = Math.round(vh * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    asciiCv.width = canvas.width;
+    asciiCv.height = canvas.height;
+    actx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    const fontSize = Math.max(5.2, CH * 0.99);
+    actx.font = `600 ${fontSize.toFixed(2)}px ui-monospace, "SF Mono", Menlo, Consolas, "Cascadia Code", monospace`;
+    actx.textAlign = 'center';
+    actx.textBaseline = 'middle';
+
+    // Downscaled bloom buffer for silky optical glow without blurring crisp glyphs
+    bloomCv.width = Math.max(64, Math.round(vw * 0.22));
+    bloomCv.height = Math.max(64, Math.round(vh * 0.22));
+
+    chBuf = new Array(N);
+    colBuf = new Array(N);
+
+    // Scale bouquet to fill ~88–92% of viewport height while fitting ~92% width on portrait phones
+    const availW = vw * 0.92;
+    const availH = vh * 0.90;
+    pxPerUnit = Math.min(availW / 114, availH / 124);
+    originX = vw * 0.5;
+    originY = (vh - 124 * pxPerUnit) * 0.52;
+
+    // Fullscreen virtual bounds so stars, fireflies, and drifting petals span 100% edge-to-edge
+    vMinX = -originX / pxPerUnit;
+    vMaxX = (vw - originX) / pxPerUnit;
+    vMinY = -originY / pxPerUnit;
+    vMaxY = (vh - originY) / pxPerUnit;
+
+    rebuildCosmos();
+  }
+
+  /* ============================================================================
+   * 2. MATH, QUANTIZED HSL COLOR CACHE & GRID PLOTTING UTILITIES
+   * ============================================================================ */
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const smoothstep = (x) => {
+    const t = clamp(x, 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+  const easeOutCubic = (x) => {
+    const t = clamp(x, 0, 1);
+    return 1 - Math.pow(1 - t, 3);
+  };
+  const easeOutBack = (x) => {
+    const t = clamp(x, 0, 1);
+    const c1 = 1.12;
+    const c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  };
+
+  // Quantized HSL cache avoids per-frame string allocations and improves bucket batching
+  const hslCache = new Map();
+  function hsl(h, s, l) {
+    const hh = (((h | 0) % 360) + 360) % 360;
+    const qh = (hh >> 1) << 1;
+    const qs = clamp((s >> 2) << 2, 0, 100);
+    const ql = clamp((l >> 1) << 1, 4, 96);
+    const key = (qh << 14) | (qs << 7) | ql;
+    let str = hslCache.get(key);
+    if (!str) {
+      str = `hsl(${qh},${qs}%,${ql}%)`;
+      hslCache.set(key, str);
+    }
+    return str;
+  }
+
+  // Write character directly to grid cell
+  function setCell(c, r, ch, color) {
+    if (c < 0 || r < 0 || c >= W || r >= H) return;
+    const idx = r * W + c;
+    chBuf[idx] = ch;
+    colBuf[idx] = color;
+  }
+
+  // Write character using virtual bouquet coordinates
+  function P(vx, vy, ch, color) {
+    const c = Math.round((originX + vx * pxPerUnit - halfCW) / CW);
+    const r = Math.round((originY + vy * pxPerUnit - halfCH) / CH);
+    if (c < 0 || r < 0 || c >= W || r >= H) return;
+    const idx = r * W + c;
+    chBuf[idx] = ch;
+    colBuf[idx] = color;
+  }
+
+  // Write character only if target cell is currently empty
+  function PEmpty(vx, vy, ch, color) {
+    const c = Math.round((originX + vx * pxPerUnit - halfCW) / CW);
+    const r = Math.round((originY + vy * pxPerUnit - halfCH) / CH);
+    if (c < 0 || r < 0 || c >= W || r >= H) return;
+    const idx = r * W + c;
+    if (!chBuf[idx]) {
+      chBuf[idx] = ch;
+      colBuf[idx] = color;
+    }
+  }
+
+  // Convert virtual bounding box to clamped grid cell rectangle
+  function vBoxToGrid(x0, y0, x1, y1) {
+    return [
+      Math.max(0, Math.floor((originX + x0 * pxPerUnit) / CW)),
+      Math.min(W - 1, Math.ceil((originX + x1 * pxPerUnit) / CW)),
+      Math.max(0, Math.floor((originY + y0 * pxPerUnit) / CH)),
+      Math.min(H - 1, Math.ceil((originY + y1 * pxPerUnit) / CH))
+    ];
+  }
+
+  // Quadratic Bézier curve from bouquet waist (BX, BY) to target (x1, y1)
+  function bezierStem(x1, y1, u, curveBias = 0.22) {
+    const cx = BX + (x1 - BX) * curveBias;
+    const cy = BY - (BY - y1) * 0.44;
+    const m = 1 - u;
+    return [
+      m * m * BX + 2 * m * u * cx + u * u * x1,
+      m * m * BY + 2 * m * u * cy + u * u * y1
+    ];
+  }
+
+  /* ============================================================================
+   * 3. INTERACTIVE BREEZE FIELD & DYNAMIC SPARKLE / POLLEN PARTICLES
+   * ============================================================================ */
+  let animStartMs = performance.now();
+  let gTime = 0;
+
+  // Invisible interactive pointer / touch wind field
+  const pointer = {
+    x: 0,
+    y: 45,
+    vx: 0,
+    vy: 0,
+    active: false,
+    strength: 0
+  };
+
+  // Dynamic stardust, bloom-burst pollen, and touch-trail sparkles
+  const sparkles = [];
+  const MAX_SPARKLES = 240;
+
+  function spawnSparkle(x, y, vx, vy, hue, isPetal = false, life = 1.0) {
+    if (sparkles.length >= MAX_SPARKLES) sparkles.shift();
+    sparkles.push({
+      x, y, vx, vy,
+      hue,
+      isPetal,
+      gravity: isPetal ? 0.015 : -0.008,
+      life,
+      maxLife: life,
+      decay: isPetal ? (0.0085 + Math.random() * 0.0065) : (0.012 + Math.random() * 0.011),
+      ch: isPetal ? (Math.random() > 0.5 ? '~' : 'o') : (Math.random() > 0.42 ? '*' : (Math.random() > 0.5 ? '+' : '°')),
+      wobble: Math.random() * Math.PI * 2
+    });
+  }
+
+  function spawnSparkleBurst(x, y, hue, count = 11) {
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2 + Math.random() * 0.45;
+      const spd = 0.28 + Math.random() * 0.62;
+      const isPetal = i % 4 === 0;
+      spawnSparkle(
+        x + Math.cos(a) * 1.4,
+        y + Math.sin(a) * 1.4,
+        Math.cos(a) * spd,
+        Math.sin(a) * spd - 0.16,
+        isPetal ? hue : 45 + (i % 3) * 4,
+        isPetal,
+        0.85 + Math.random() * 0.48
+      );
+    }
+  }
+
+  // Multi-frequency organic natural breeze + localized pointer/touch sway
+  function getWindOffset(vx, vy, phase) {
+    const hNorm = Math.max(0, (BY - vy) / 78);
+    const hPow = Math.pow(hNorm, 1.32);
+
+    const wave =
+      Math.sin(gTime * 0.88 + phase + vx * 0.036) * 1.95 +
+      Math.sin(gTime * 1.74 + phase * 1.65 - vy * 0.044) * 0.70 +
+      Math.sin(gTime * 0.42 + vx * 0.02) * 0.55;
+
+    let dx = wave * hPow;
+    let dy = Math.cos(gTime * 1.08 + phase) * 0.38 * hPow;
+
+    if (pointer.strength > 0.01) {
+      const rx = vx - pointer.x;
+      const ry = vy - pointer.y;
+      const distSq = rx * rx + ry * ry;
+      const radius = 32;
+      if (distSq < radius * radius && distSq > 0.005) {
+        const dist = Math.sqrt(distSq);
+        const falloff = Math.pow(1 - dist / radius, 2) * pointer.strength * (0.36 + hPow * 0.88);
+        dx += (rx / dist) * 6.8 * falloff + pointer.vx * 0.38 * falloff;
+        dy += (ry / dist) * 3.8 * falloff + pointer.vy * 0.24 * falloff;
+      }
+    }
+    return [dx, dy];
+  }
+
+  /* ============================================================================
+   * 4. LUSH MULTI-SPECIES FOLIAGE RENDERERS
+   * ============================================================================ */
+
+  // Curved Bézier stem growing from waist up to progress maxU (0..1)
+  function drawStem(x1, y1, maxU, hue, sat, lum0, thick = true, curveBias = 0.22) {
+    if (maxU <= 0.01) return;
+    let px = BX, py = BY;
+    const steps = Math.max(12, Math.ceil(66 * maxU));
+    for (let i = 1; i <= steps; i++) {
+      const u = (i / steps) * maxU;
+      const [x, y] = bezierStem(x1, y1, u, curveBias);
+      const dx = x - px, dy = y - py;
+      const ratio = Math.abs(dx) / (Math.abs(dy) + 0.001);
+      const ch = ratio < 0.28 ? '|' : ratio > 2.2 ? '-' : (dx * dy < 0 ? '/' : '\\');
+      const l = lum0 + u * 14;
+      P(x, y, ch, hsl(hue, sat, l));
+      if (thick) {
+        P(x + 0.52, y, ch, hsl(hue - 4, sat, l - 7));
+      }
+      px = x; py = y;
+    }
+  }
+
+  // Detailed veined rose leaf with central rib and serrated highlights
+  function drawRoseLeaf(bx, by, ang, len, wid, hue, sat) {
+    if (len < 1.1 || wid < 0.35) return;
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    const nx = -dy, ny = dx;
+    const stepS = 1 / Math.max(8, len * 2.15);
+    for (let s = 0; s <= 1; s += stepS) {
+      const serrate = 1 + 0.10 * Math.sin(s * 28);
+      const w = wid * Math.sin(Math.PI * Math.pow(s, 0.76)) * serrate;
+      for (let v = -w; v <= w; v += 0.46) {
+        const x = bx + dx * (s * len) + nx * v;
+        const y = by + dy * (s * len) + ny * v;
+        const q = Math.abs(v) / (w + 0.01);
+        const vein = Math.round(s * len * 1.2) % 3 === 0 && q > 0.16 && q < 0.88;
+        const light = -(nx * v + ny * v) * 1.7 + s * 10;
+        let ch;
+        if (q < 0.14) ch = Math.abs(dx) > Math.abs(dy) ? '-' : '|';
+        else if (q > 0.87) ch = v > 0 ? "'" : ',';
+        else if (vein) ch = v > 0 ? '/' : '\\';
+        else ch = PETAL_RAMP[clamp(Math.floor(2 + (1 - q) * 6), 1, 9)];
+        P(x, y, ch, hsl(hue + s * 7, sat, clamp(21 + (1 - q) * 16 + light, 12, 56)));
+      }
+    }
+  }
+
+  // Feathered botanical fern frond (uncurls leaflet by leaflet)
+  function drawFernFrond(tipX, tipY, phase, stemU, leafProg) {
+    if (stemU <= 0.04) return;
+    const [wx, wy] = getWindOffset(tipX, tipY, phase);
+    const tx = tipX + wx;
+    const ty = tipY + wy;
+    const steps = 46;
+    const maxI = Math.floor(steps * stemU);
+    let px = BX, py = BY;
+
+    for (let i = 1; i <= maxI; i++) {
+      const u = i / steps;
+      const [x, y] = bezierStem(tx, ty, u, 0.34);
+      const dx = x - px, dy = y - py;
+      const ang = Math.atan2(dy, dx);
+      if (u > 0.22) {
+        P(x, y, Math.abs(dx) < Math.abs(dy) * 0.4 ? '|' : (dx * dy < 0 ? '/' : '\\'), hsl(142, 46, 22 + u * 13));
+      }
+      const localLeaf = clamp((leafProg * 1.38 - (u - 0.30)) * 2.25, 0, 1);
+      if (u > 0.30 && i % 2 === 0 && localLeaf > 0.04) {
+        const taper = Math.sin(Math.PI * ((u - 0.30) / 0.70));
+        const pinnaLen = (8.2 * taper + 1.3) * easeOutCubic(localLeaf);
+        for (const side of [-1, 1]) {
+          const pAng = ang + side * (1.16 - u * 0.34);
+          const pdx = Math.cos(pAng), pdy = Math.sin(pAng);
+          const pSteps = Math.max(3, Math.floor(pinnaLen * 1.65));
+          for (let k = 1; k <= pSteps; k++) {
+            const f = k / pSteps;
+            const lx = x + pdx * f * pinnaLen;
+            const ly = y + pdy * f * pinnaLen;
+            const c = f > 0.82 ? '.' : f > 0.48 ? (side > 0 ? '/' : '\\') : (k % 2 ? '~' : '=');
+            P(lx, ly, c, hsl(140 + f * 10, 50, clamp(25 + (1 - f) * 15 + (side < 0 ? 5 : -2), 16, 60)));
+          }
+        }
+      }
+      px = x; py = y;
+    }
+  }
+
+  // Silver-dollar eucalyptus branch with overlapping blue-green leaves & silver sheen
+  function drawEucalyptus(tipX, tipY, phase, stemU, leafProg) {
+    if (stemU <= 0.04) return;
+    const [wx, wy] = getWindOffset(tipX, tipY, phase);
+    const tx = tipX + wx;
+    const ty = tipY + wy;
+    drawStem(tx, ty, stemU, 162, 26, 24, false, 0.26);
+
+    if (leafProg <= 0.02) return;
+    for (let u = 0.34; u <= Math.min(0.99, stemU); u += 0.082) {
+      const pop = easeOutBack(clamp((leafProg * 1.32 - (u - 0.34)) * 2.4, 0, 1));
+      if (pop <= 0.05) continue;
+      const [sx, sy] = bezierStem(tx, ty, u, 0.26);
+      const side = Math.round(u * 100) % 2 ? 1 : -1;
+      const rx = (2.75 - u * 0.85) * pop;
+      const ry = (2.15 - u * 0.60) * pop;
+      const cx = sx + side * (rx + 0.8);
+      const cy = sy - 0.25;
+
+      const [c0, c1, r0, r1] = vBoxToGrid(cx - rx - 0.5, cy - ry - 0.5, cx + rx + 0.5, cy + ry + 0.5);
+      for (let r = r0; r <= r1; r++) {
+        const vy = (r * CH + halfCH - originY) / pxPerUnit;
+        const dy = vy - cy;
+        for (let c = c0; c <= c1; c++) {
+          const vx = (c * CW + halfCW - originX) / pxPerUnit;
+          const dx = vx - cx;
+          const q = (dx / rx) ** 2 + (dy / ry) ** 2;
+          if (q > 1) continue;
+          const rim = q > 0.65 && (dx + dy < 0.35);
+          const sheen = q < 0.24;
+          const ch = rim ? 'o' : sheen ? '@' : q < 0.65 ? 'O' : ':';
+          const lum = rim ? 72 : sheen ? 58 : clamp(38 + (1 - q) * 16 - (dx + dy) * 2.6, 22, 66);
+          setCell(c, r, ch, hsl(166 + (rim ? 10 : 0), 30, lum));
+        }
+      }
+    }
+  }
+
+  // Tall multi-tiered lavender spike blooming bottom-to-top
+  function drawLavender(tipX, tipY, phase, stemU, spikeProg) {
+    if (stemU <= 0.04) return;
+    const [wx, wy] = getWindOffset(tipX, tipY, phase);
+    const tx = tipX + wx;
+    const ty = tipY + wy;
+    drawStem(tx, ty, stemU, 138, 38, 22, false, 0.24);
+
+    if (spikeProg <= 0.02) return;
+    const maxFloretU = 0.52 + 0.48 * Math.min(1, spikeProg);
+    for (let u = 0.52; u <= Math.min(maxFloretU, stemU); u += 0.016) {
+      const [sx, sy] = bezierStem(tx, ty, u, 0.24);
+      const tier = Math.sin(((u - 0.52) / 0.48) * Math.PI);
+      const spread = 1.75 * tier + 0.42;
+      const side = Math.round(u * 120) % 2 ? 1 : -1;
+      const lumBase = 48 + u * 24;
+      P(sx + side * spread, sy, u > 0.94 ? '^' : '*', hsl(272 + u * 18, 70, lumBase));
+      P(sx - side * spread * 0.68, sy + 0.24, '%', hsl(266 + u * 12, 62, lumBase - 11));
+      P(sx, sy - 0.2, u > 0.96 ? '^' : ':', hsl(280, 74, lumBase + 13));
+    }
+  }
+
+  // Delicate clouds of Baby's Breath (Schleierkraut)
+  function drawBabysBreath(spray, prog) {
+    if (prog <= 0.02) return;
+    const [wx, wy] = getWindOffset(spray.x, spray.y, spray.phase);
+    const bx = spray.x + wx;
+    const by = spray.y + wy;
+    const b = easeOutCubic(prog);
+
+    for (let i = 0; i < spray.nodes.length; i++) {
+      const nd = spray.nodes[i];
+      const nx = bx + nd.dx * b;
+      const ny = by + nd.dy * b;
+      PEmpty((bx + nx) * 0.5, (by + ny) * 0.5, nd.dx > 0 ? '/' : '\\', hsl(138, 30, 30));
+
+      const twinkle = 0.5 + 0.5 * Math.sin(gTime * 2.5 + spray.phase + i * 1.9);
+      const ch = twinkle > 0.68 ? '*' : twinkle > 0.34 ? '+' : '.';
+      const lum = (74 + twinkle * 22) * Math.min(1, prog * 1.4);
+      P(nx, ny, ch, hsl(42, 40, lum));
+      if (twinkle > 0.62 && prog > 0.6) {
+        PEmpty(nx + 0.55, ny - 0.35, "'", hsl(44, 30, 88));
+      }
+    }
+  }
+
+  /* ============================================================================
+   * 5. ULTRA-DETAILED FLOWER RENDERERS (5 BOTANICAL SPECIES, 22 BLOOMS)
+   * ============================================================================ */
+
+  // 1) VELVETY MULTI-LAYERED ROSE (6 concentric ruffled spiral layers + dewdrops)
+  function drawRose(f) {
+    const R = f.R * f.scale;
+    if (R < 1.0) return;
+    const rot = gTime * 0.16 * f.dir + f.phase;
+    const [c0, c1, r0, r1] = vBoxToGrid(f.hx - R - 1, f.hy - R - 1, f.hx + R + 1, f.hy + R + 1);
+    const maxLayers = Math.max(1, Math.min(6, Math.ceil(f.open * 6)));
+
+    for (let r = r0; r <= r1; r++) {
+      const vy = (r * CH + halfCH - originY) / pxPerUnit;
+      const ry = vy - f.hy;
+      for (let c = c0; c <= c1; c++) {
+        const vx = (c * CW + halfCW - originX) / pxPerUnit;
+        const rx = vx - f.hx;
+        const rad = Math.hypot(rx, ry);
+        if (rad > R * 1.05) continue;
+        const a = Math.atan2(ry, rx);
+
+        for (let l = 0; l < maxLayers; l++) {
+          const layerProg = clamp(f.open * 6 - l, 0, 1);
+          const petals = 4 + l;
+          const Rl = R * (0.17 + 0.166 * l) * (0.72 + 0.28 * layerProg);
+          const swirl = a + rot * (l % 2 ? -0.78 : 0.78) + l * 1.2 + rad * 0.068;
+          const lobe = Math.abs(Math.cos(petals * swirl * 0.5));
+          const ruffle = 1 + 0.04 * Math.sin((petals * 3) * swirl);
+          const edge = Rl * (0.74 + 0.26 * Math.pow(lobe, 0.76)) * ruffle;
+          if (rad > edge) continue;
+
+          const n = rad / (edge + 0.001);
+          // 3D directional lighting from top-left + subtle warm rim bounce
+          const dirLight = -(rx * 0.72 + ry * 0.72) / (R + 0.1);
+          const bounce = Math.max(0, (rx * 0.4 + ry * 0.8) / (R + 0.1)) * 5;
+          const rimCatch = n > 0.85 ? (n - 0.85) * 130 : 0;
+          const coreShadow = l === 0 ? -14 * (1 - n) : 0;
+          const foldShade = Math.sin(petals * swirl + rad * 0.55) * 6;
+
+          const lum = clamp(
+            21 + f.lShift + l * 6.8 + n * n * 18 + dirLight * 15 + bounce + rimCatch + coreShadow + foldShade,
+            12,
+            92
+          );
+          const hue = f.h + Math.sin(a * 2 + l) * 9 - (1 - n) * 5;
+          const sat = clamp(f.s + (1 - l * 0.04) * 8 - (rimCatch > 10 ? 14 : 0), 34, 96);
+
+          let ch;
+          if (n > 0.93) {
+            ch = dirLight > 0.12 ? 'o' : (rx > 0 ? ')' : '(');
+          } else if (l === 0 && n < 0.46) {
+            ch = '@';
+          } else {
+            const idx = clamp(
+              Math.floor((0.15 + 0.65 * n + dirLight * 0.22) * (SHADE_RAMP.length - 1)),
+              2,
+              SHADE_RAMP.length - 1
+            );
+            ch = SHADE_RAMP[idx];
+          }
+          setCell(c, r, ch, hsl(hue, sat, lum));
+          break;
+        }
+      }
+    }
+
+    // Sparkling cyan-white dewdrop on upper-left outer petal
+    if (f.open > 0.78 && f.dew) {
+      const glint = Math.sin(gTime * 3.2 + f.phase) > 0.05;
+      P(f.hx - R * 0.43, f.hy - R * 0.37, glint ? '*' : '°', hsl(192, 65, glint ? 96 : 84));
+      if (glint) PEmpty(f.hx - R * 0.38, f.hy - R * 0.42, "'", hsl(196, 50, 92));
+    }
+  }
+
+  // 2) LUSH FRILLY PEONY (dense scalloped layers + glowing golden stamen heart)
+  function drawPeony(f) {
+    const R = f.R * f.scale;
+    if (R < 1.0) return;
+    const rot = gTime * 0.14 * f.dir + f.phase;
+    const Rc = R * 0.24;
+    const [c0, c1, r0, r1] = vBoxToGrid(f.hx - R - 1, f.hy - R - 1, f.hx + R + 1, f.hy + R + 1);
+    const maxLayers = Math.max(1, Math.min(4, Math.ceil(f.open * 4)));
+
+    for (let r = r0; r <= r1; r++) {
+      const vy = (r * CH + halfCH - originY) / pxPerUnit;
+      const ry = vy - f.hy;
+      for (let c = c0; c <= c1; c++) {
+        const vx = (c * CW + halfCW - originX) / pxPerUnit;
+        const rx = vx - f.hx;
+        const rad = Math.hypot(rx, ry);
+        if (rad > R * 1.08) continue;
+        const a = Math.atan2(ry, rx);
+
+        if (rad < Rc) {
+          const nr = rad / Rc;
+          const sparkle = Math.sin(rad * 4.5 + a * 6 + gTime * 2.2) > 0.20;
+          const ch = nr < 0.44 ? '@' : sparkle ? '*' : '%';
+          setCell(c, r, ch, hsl(44 + nr * 8, 96, 48 + (1 - nr) * 34 + (sparkle ? 10 : 0)));
+          continue;
+        }
+
+        for (let l = 0; l < maxLayers; l++) {
+          const Rl = R * (0.40 + l * 0.21);
+          const ruffle =
+            Math.sin((9 + l * 3) * (a + rot * (l % 2 ? -1 : 1)) + l * 1.7) * 0.12 +
+            Math.cos((17 + l * 2) * a - l) * 0.05;
+          const edge = Rl * (0.86 + ruffle);
+          if (rad > edge) continue;
+
+          const n = (rad - Rc * 0.6) / (edge - Rc * 0.6 + 0.01);
+          const dirLight = -(rx * 0.68 + ry * 0.72) / (R + 0.1);
+          const lum = clamp(32 + f.lShift + l * 7.5 + n * 16 + dirLight * 14 + (n > 0.84 ? 14 : 0), 20, 94);
+          const hue = f.h + Math.sin(a * 3 + l) * 7;
+          const ch = n > 0.9 ? '~' : n > 0.78 ? 'w' : SOFT_RAMP[clamp(Math.floor(3 + (1 - n) * 10 + dirLight * 3), 2, SOFT_RAMP.length - 1)];
+          setCell(c, r, ch, hsl(hue, f.s, lum));
+          break;
+        }
+      }
+    }
+  }
+
+  // 3) STARGAZER LILY (6 pointed curved petals, deep magenta midribs, pale glowing edges, speckled burgundy throat & amber anthers)
+  function drawStargazerLily(f) {
+    const R = f.R * f.scale;
+    if (R < 1.2) return;
+    const rot = gTime * 0.11 * f.dir + f.phase;
+    const [c0, c1, r0, r1] = vBoxToGrid(f.hx - R - 1, f.hy - R - 1, f.hx + R + 1, f.hy + R + 1);
+
+    for (let r = r0; r <= r1; r++) {
+      const vy = (r * CH + halfCH - originY) / pxPerUnit;
+      const ry = vy - f.hy;
+      for (let c = c0; c <= c1; c++) {
+        const vx = (c * CW + halfCW - originX) / pxPerUnit;
+        const rx = vx - f.hx;
+        const rad = Math.hypot(rx, ry);
+        if (rad > R * 1.06) continue;
+        const a = Math.atan2(ry, rx);
+
+        // Gentle petal curvature along radius + 6 dramatic pointed petals
+        const curvedA = a + rot + (rad / R) * 0.11 * f.dir;
+        const petalWave = Math.abs(Math.cos(3 * curvedA));
+        const edge = R * (0.24 + 0.76 * Math.pow(petalWave, 0.58));
+        if (rad > edge) continue;
+
+        const n = rad / (edge + 0.001);
+        const dirLight = -(rx * 0.70 + ry * 0.70) / (R + 0.1);
+        // Angular closeness to each petal's central midrib
+        const ribDist = Math.abs(Math.sin(3 * curvedA));
+        const isMidrib = ribDist < 0.14 && n > 0.14 && n < 0.88;
+        const isPaleMargin = n > 0.74 || petalWave < 0.42;
+        // Burgundy spots speckled across the inner throat
+        const speckle = n > 0.16 && n < 0.56 && ribDist < 0.42 && (((c * 19 + r * 37) & 15) === 0);
+
+        if (rad < R * 0.15) {
+          setCell(c, r, '@', hsl(340, 68, 22));
+        } else if (speckle) {
+          setCell(c, r, ':', hsl(344, 78, 24));
+        } else if (isMidrib) {
+          const lum = clamp(44 + (1 - n) * 14 + dirLight * 10, 26, 70);
+          setCell(c, r, n > 0.65 ? '|' : '#', hsl(f.h, 88, lum));
+        } else if (isPaleMargin) {
+          const lum = clamp(76 + n * 16 + dirLight * 8, 60, 96);
+          const ch = n > 0.90 ? '^' : n > 0.82 ? 'o' : SOFT_RAMP[clamp(Math.floor(4 + n * 6), 2, 12)];
+          setCell(c, r, ch, hsl(f.h - 4, 34, lum));
+        } else {
+          const lum = clamp(50 + n * 24 + dirLight * 12, 30, 88);
+          const ch = PETAL_RAMP[clamp(Math.floor(3 + n * 6), 2, 10)];
+          setCell(c, r, ch, hsl(f.h + 4, clamp(78 - n * 24, 36, 86), lum));
+        }
+      }
+    }
+
+    // 6 projecting delicate stamens tipped with glowing amber-gold anthers
+    if (f.open > 0.45) {
+      const sLen = R * 0.48 * f.open;
+      for (let k = 0; k < 6; k++) {
+        const sa = rot + (k / 6) * Math.PI * 2 + 0.52;
+        const cs = Math.cos(sa), sn = Math.sin(sa);
+        for (const frac of [0.35, 0.68]) {
+          const fx = f.hx + cs * sLen * frac;
+          const fy = f.hy + sn * sLen * frac;
+          P(fx, fy, Math.abs(cs) > 0.65 ? '-' : Math.abs(sn) > 0.65 ? '|' : (cs * sn > 0 ? '\\' : '/'), hsl(350, 42, 74));
+        }
+        const tx = f.hx + cs * sLen;
+        const ty = f.hy + sn * sLen;
+        const pulse = Math.sin(gTime * 3.0 + f.phase + k) > 0;
+        P(tx, ty, pulse ? '*' : 'o', hsl(36, 98, pulse ? 86 : 72));
+      }
+    }
+  }
+
+  // 4) GERBERA DAISY (double-row radiating narrow petals + Fibonacci-spiral seed disc)
+  function drawDaisy(f) {
+    const R = f.R * f.scale;
+    if (R < 1.0) return;
+    const rot = gTime * 0.14 * f.dir + f.phase;
+    const Rc = R * 0.31;
+    const NP = 18;
+    const [c0, c1, r0, r1] = vBoxToGrid(f.hx - R - 1, f.hy - R - 1, f.hx + R + 1, f.hy + R + 1);
+
+    for (let r = r0; r <= r1; r++) {
+      const vy = (r * CH + halfCH - originY) / pxPerUnit;
+      const ry = vy - f.hy;
+      for (let c = c0; c <= c1; c++) {
+        const vx = (c * CW + halfCW - originX) / pxPerUnit;
+        const rx = vx - f.hx;
+        const rad = Math.hypot(rx, ry);
+        if (rad > R) continue;
+        const a = Math.atan2(ry, rx);
+        const dirLight = -(rx * 0.70 + ry * 0.70) / (R + 0.1);
+
+        const csFront = Math.abs(Math.cos(NP * (a + rot) * 0.5));
+        const eFront = R * (0.40 + 0.60 * Math.pow(csFront, 0.54));
+        const csBack = Math.abs(Math.cos(NP * (a + rot + Math.PI / NP) * 0.5));
+        const eBack = R * (0.36 + 0.56 * Math.pow(csBack, 0.54));
+
+        if (rad < Rc) {
+          setCell(c, r, ':', hsl(34, 78, 21 + dirLight * 8));
+        } else if (rad <= eFront) {
+          const n = (rad - Rc) / (eFront - Rc + 0.01);
+          const crease = csFront > 0.94;
+          const ch = n > 0.91 ? 'o' : crease ? '|' : PETAL_RAMP[clamp(Math.floor(2 + (1 - n) * 6), 2, 10)];
+          const lum = clamp(56 + (1 - n) * 24 - (crease ? 10 : 0) + dirLight * 12, 28, 92);
+          setCell(c, r, ch, hsl(f.h + n * 6, f.s, lum));
+        } else if (rad <= eBack) {
+          const n = (rad - Rc) / (eBack - Rc + 0.01);
+          setCell(c, r, n > 0.88 ? '.' : ':', hsl(f.h - 6, Math.max(36, f.s - 12), clamp(36 + (1 - n) * 16 + dirLight * 8, 20, 68)));
+        }
+      }
+    }
+
+    // Golden-angle Fibonacci seed spiral disc
+    const GOLDEN_ANGLE = 2.39996323;
+    const seedCount = Math.floor(28 + R * 4.5);
+    for (let k = 0; k < seedCount; k++) {
+      const frac = k / seedCount;
+      const sr = Math.sqrt(frac) * (Rc * 0.96);
+      const sa = k * GOLDEN_ANGLE + rot * 0.5;
+      const ch = frac < 0.25 ? '@' : frac < 0.58 ? '#' : frac < 0.85 ? '%' : 'o';
+      const lum = clamp(32 + frac * 35 + (k % 3 === 0 ? 10 : 0), 22, 86);
+      P(f.hx + Math.cos(sa) * sr, f.hy + Math.sin(sa) * sr, ch, hsl(38 + frac * 14, 92, lum));
+    }
+  }
+
+  // 5) SCULPTED TULIP (cupped 3-lobe form with sunlit outer curves & glowing stamens)
+  function drawTulip(f) {
+    const R = f.R * f.scale;
+    if (R < 1.2) return;
+    const tilt = f.tilt + Math.sin(gTime * 0.88 + f.phase) * 0.06;
+    const cosT = Math.cos(-tilt), sinT = Math.sin(-tilt);
+    const pad = R * 1.25;
+    const [c0, c1, r0, r1] = vBoxToGrid(f.hx - pad, f.hy - pad, f.hx + pad, f.hy + pad);
+
+    for (let r = r0; r <= r1; r++) {
+      const vy = (r * CH + halfCH - originY) / pxPerUnit;
+      const dy = vy - f.hy;
+      for (let c = c0; c <= c1; c++) {
+        const vx = (c * CW + halfCW - originX) / pxPerUnit;
+        const dx = vx - f.hx;
+        const u = dx * cosT - dy * sinT;
+        const v = dx * sinT + dy * cosT;
+        const vn = (v + R) / (2 * R);
+        if (vn < 0 || vn > 1) continue;
+
+        const cupW = R * (0.76 * Math.sin(Math.pow(vn, 0.72) * Math.PI) + 0.16 * (1 - vn));
+        const au = Math.abs(u);
+        if (au > cupW) continue;
+
+        const topDip = Math.cos((u / (cupW + 0.01)) * Math.PI * 1.5);
+        const rimCut = 0.16 * (1 - Math.abs(topDip));
+        if (vn < rimCut) continue;
+
+        const isCenterPetal = au < cupW * 0.56;
+        const vein = Math.abs(Math.sin((u / (R * 0.14)) * Math.PI)) > 0.88;
+        const dirLight = -(dx * 0.68 + dy * 0.66) / (R + 0.1);
+
+        if (vn < 0.34 && au < R * 0.22 && !isCenterPetal) {
+          setCell(c, r, '*', hsl(46, 98, 82));
+          continue;
+        }
+
+        const baseGrad = 1 - vn;
+        const rimSun = vn < rimCut + 0.12 ? 10 : 0;
+        const lum = clamp(30 + baseGrad * 32 + (isCenterPetal ? 8 : -5) + (vein ? 6 : 0) + dirLight * 13 + rimSun, 18, 92);
+        const ch = vn < rimCut + 0.07 ? '^' : vein ? '|' : PETAL_RAMP[clamp(Math.floor(2 + baseGrad * 7), 2, 10)];
+        setCell(c, r, ch, hsl(f.h + baseGrad * 12, f.s, lum));
+      }
+    }
+
+    if (f.open > 0.55) {
+      for (const s of [-0.18, 0, 0.18]) {
+        const sx = f.hx + (s * R) * Math.cos(tilt) + (-R * 0.62) * Math.sin(tilt);
+        const sy = f.hy + (s * R) * Math.sin(tilt) + (-R * 0.62) * Math.cos(tilt);
+        P(sx, sy, '*', hsl(46, 98, 86));
+      }
+    }
+  }
+
+  /* ============================================================================
+   * 6. LUXURY MULTI-LAYER WRAPPING PAPER & SCULPTED 3D SATIN RIBBON + BOW
+   * ============================================================================ */
+
+  // Rear pleated blush/ivory silk tissue paper fanning behind the upper bouquet
+  function drawBackTissue(prog) {
+    if (prog <= 0.02) return;
+    const p = easeOutCubic(prog);
+    const topY = 84 - 31 * p;
+    const [c0, c1, r0, r1] = vBoxToGrid(-40 * p, topY - 2, 40 * p, 90);
+
+    for (let r = r0; r <= r1; r++) {
+      const y = (r * CH + halfCH - originY) / pxPerUnit;
+      if (y < topY || y > 90) continue;
+      const progress = (y - topY) / Math.max(1, 90 - topY);
+      const halfW = (39 * p) * (1 - progress * 0.68);
+      for (let c = c0; c <= c1; c++) {
+        const x = (c * CW + halfCW - originX) / pxPerUnit;
+        if (Math.abs(x - BX) > halfW) continue;
+        const rel = (x - BX) / (halfW + 0.01);
+        const scallop = Math.sin(rel * 13 + gTime * 0.35) * 2.5 + rel * rel * 7.5;
+        const ruffleTop = topY + scallop;
+        if (y < ruffleTop) continue;
+        const pleat = Math.sin(rel * 20 + y * 0.10);
+        const isEdge = y < ruffleTop + 1.45;
+        const ch = isEdge ? '~' : pleat > 0.68 ? '|' : ((c + r) % 2 ? '.' : ':');
+        const lum = clamp(76 - progress * 16 + pleat * 7 - rel * 7 + (isEdge ? 10 : 0), 32, 92);
+        setCell(c, r, ch, hsl(350 + (pleat > 0 ? 12 : 0), 38, lum));
+      }
+    }
+  }
+
+  // Front hand-folded warm kraft/parchment paper cone with 3D cylindrical shading & diagonal folds
+  function drawWrappingPaper(unfoldProg, tissueProg) {
+    if (unfoldProg <= 0.02) return;
+    const u = easeOutCubic(unfoldProg);
+
+    // Front ruffled blush/ivory tissue collar peeking above kraft cuff
+    if (tissueProg > 0.05) {
+      const tp = easeOutCubic(tissueProg);
+      const tTop = 79 - 6.5 * tp;
+      const [tc0, tc1, tr0, tr1] = vBoxToGrid(-24 * tp, tTop, 24 * tp, 83);
+      for (let r = tr0; r <= tr1; r++) {
+        const y = (r * CH + halfCH - originY) / pxPerUnit;
+        const hw = (23 * tp) - Math.max(0, y - tTop) * 0.4;
+        for (let c = tc0; c <= tc1; c++) {
+          const x = (c * CW + halfCW - originX) / pxPerUnit;
+          if (Math.abs(x - BX) > hw) continue;
+          const rel = (x - BX) / (hw + 0.01);
+          const rim = tTop + Math.sin(rel * 15) * 1.4 + (1 - rel * rel) * 3.2;
+          if (y < rim) continue;
+          const isRim = y < rim + 1.25;
+          setCell(c, r, isRim ? '~' : ':', hsl(354, 42, clamp(80 - rel * 9 + (isRim ? 8 : 0), 42, 92)));
+        }
+      }
+    }
+
+    // Main kraft/parchment cone unfolding smoothly upward from base (CONE_BOT = 123 -> 73)
+    const curTopY = CONE_BOT - (CONE_BOT - 73) * u;
+    const [c0, c1, r0, r1] = vBoxToGrid(-26, curTopY - 1, 26, CONE_BOT + 1);
+
+    for (let r = r0; r <= r1; r++) {
+      const y = (r * CH + halfCH - originY) / pxPerUnit;
+      if (y < curTopY || y > CONE_BOT) continue;
+      const t = (y - 73) / (CONE_BOT - 73);
+      const waistPinch = Math.exp(-Math.pow((y - BY) / 8.0, 2)) * 4.4;
+      const hw = Math.max(2.0, ((24.0 * (1 - t * 0.84)) - waistPinch) * (0.4 + 0.6 * u));
+
+      for (let c = c0; c <= c1; c++) {
+        const x = (c * CW + halfCW - originX) / pxPerUnit;
+        if (Math.abs(x - BX) > hw) continue;
+        const rel = (x - BX) / (hw + 0.01);
+        const vEdge = curTopY + Math.abs(rel) * 3.5 - (rel < 0 ? 1.4 : 0);
+        if (y < vEdge) continue;
+
+        const isLeftBorder = x < BX - hw + 0.9;
+        const isRightBorder = x > BX + hw - 0.9;
+        // Overlapping diagonal fold seams
+        const seam1 = BX + (y - 73) * 0.34 - 8.5;
+        const seam2 = BX - (y - 73) * 0.24 + 9.0;
+        const distS1 = x - seam1;
+        const onSeam1 = Math.abs(distS1) < 0.85 && y < 115;
+        const onSeam2 = Math.abs(x - seam2) < 0.72 && y < 104 && x > seam1 + 1.5;
+        const seamShadow = (distS1 > 0 && distS1 < 3.4 && y < 115) ? -12 : 0;
+
+        // Cylindrical 3D lighting from top-left + subtle kraft linen crosshatch
+        const cylLight = Math.cos((rel + 0.30) * Math.PI * 0.56) * 15;
+        const pleat = Math.sin(rel * 13 + y * 0.09) * 4.5;
+        const hatch = ((c + r) % 3 === 0) ? 2.5 : -1;
+
+        let ch;
+        if (y < vEdge + 1.3) ch = '=';
+        else if (isLeftBorder) ch = '\\';
+        else if (isRightBorder) ch = '/';
+        else if (onSeam1) ch = '\\';
+        else if (onSeam2) ch = '/';
+        else if (pleat > 3.1) ch = '|';
+        else ch = ((c + r) % 2 ? ':' : ((c ^ r) & 3 ? '.' : '-'));
+
+        const lum = clamp(44 + cylLight + pleat + seamShadow + hatch - t * 6, 14, 74);
+        setCell(c, r, ch, hsl(32, 38, lum));
+      }
+    }
+  }
+
+  // Sculpted Crimson-Rose 3D Satin Ribbon, Multi-Layer Double Bow & Fluttering V-Notched Tails
+  function drawSatinRibbon(bowProg) {
+    if (bowProg <= 0.02) return;
+    const rh = 344, rs = 86, rl = 54;
+    const [wx, wy] = getWindOffset(BX, BY, 4.2);
+    const tailSway = wx * 0.62 + Math.sin(gTime * 1.5) * 1.35;
+
+    // 1. Wrapped satin waist band (0.0 -> 0.35)
+    const bandP = easeOutCubic(clamp(bowProg / 0.35, 0, 1));
+    if (bandP > 0.02) {
+      const hw = 14.0 * bandP;
+      const [c0, c1, r0, r1] = vBoxToGrid(-hw - 1, BY - 2, hw + 1, BY + 2.6);
+      for (let r = r0; r <= r1; r++) {
+        const y = (r * CH + halfCH - originY) / pxPerUnit;
+        if (y < BY - 1.6 || y > BY + 2.2) continue;
+        for (let c = c0; c <= c1; c++) {
+          const x = (c * CW + halfCW - originX) / pxPerUnit;
+          if (Math.abs(x - BX) > hw) continue;
+          const rel = (x - BX) / (hw + 0.01);
+          const sheen = Math.exp(-Math.pow((rel + 0.24) * 3.4, 2)) * 24;
+          const isEdge = y < BY - 0.8 || y > BY + 1.45;
+          const ch = isEdge ? '=' : sheen > 13 ? '*' : '~';
+          setCell(c, r, ch, hsl(rh, rs, clamp(rl - 6 + sheen - rel * 8, 20, 90)));
+        }
+      }
+    }
+
+    // 2. Gracefully curving, V-notched ribbon tails that unroll and flutter (0.50 -> 1.0)
+    const tailP = easeOutCubic(clamp((bowProg - 0.50) / 0.50, 0, 1));
+    if (tailP > 0.02) {
+      const tailLen = 29 * tailP;
+      for (const side of [-1, 1]) {
+        for (let s = 0; s <= tailLen; s += 0.58) {
+          const u = s / 29;
+          const curveX = BX + side * (2.4 + u * 13.0 + Math.sin(u * 3.5) * 2.0) + tailSway * u * u * 1.5;
+          const curveY = BY + 2 + s;
+          const halfW = 1.6 + u * 1.6;
+          for (let dx = -halfW; dx <= halfW; dx += 0.50) {
+            const rx = dx / halfW;
+            // V-notch cutout at ribbon end
+            if (tailP > 0.84 && u > 0.86 && Math.abs(rx) < (u - 0.86) / 0.14) continue;
+            const sheen = Math.exp(-Math.pow((rx + 0.16) * 2.6, 2)) * 22;
+            const isRim = Math.abs(rx) > 0.78;
+            const ch = isRim ? (side > 0 ? '\\' : '/') : sheen > 11 ? '=' : (s % 2 < 1 ? '#' : '%');
+            P(curveX + dx, curveY, ch, hsl(rh, rs, clamp(rl - 4 + sheen - u * 8 + (side < 0 ? 4 : -2), 18, 90)));
+          }
+        }
+      }
+    }
+
+    // 3. Multi-Layered 3D Satin Double Bow Loops (back accent loops + front sculpted loops)
+    const loopP = easeOutBack(clamp((bowProg - 0.28) / 0.48, 0, 1));
+    if (loopP > 0.04) {
+      // Back upper-tilted secondary loops for lush multi-layered volume
+      for (const side of [-1, 1]) {
+        const rxMax = 7.4 * loopP;
+        const ryMax = 3.8 * loopP;
+        const cx = BX + side * (8.6 * loopP) + tailSway * 0.09;
+        const cy = BY - 3.6 * loopP + wy * 0.14;
+        const [c0, c1, r0, r1] = vBoxToGrid(cx - rxMax - 1, cy - ryMax - 1, cx + rxMax + 1, cy + ryMax + 1);
+        for (let r = r0; r <= r1; r++) {
+          const y = (r * CH + halfCH - originY) / pxPerUnit;
+          const dy = y - cy;
+          for (let c = c0; c <= c1; c++) {
+            const x = (c * CW + halfCW - originX) / pxPerUnit;
+            const dx = x - cx;
+            const q = (dx / rxMax) ** 2 + (dy / ryMax) ** 2;
+            if (q > 1) continue;
+            const inner = q < 0.44 && dy > -0.4;
+            const rim = !inner && dy < -0.5 && q > 0.45;
+            const lum = inner ? clamp(rl - 30 + q * 16, 10, 30) : clamp(rl - 6 + (rim ? 20 : 0) - dy * 2.5, 22, 84);
+            setCell(c, r, inner ? ':' : rim ? '=' : '#', hsl(rh - 4, rs - 4, lum));
+          }
+        }
+      }
+
+      // Main front puffed 3D satin bow loops with bright specular rim & deep inner pocket shadow
+      for (const side of [-1, 1]) {
+        const rxMax = 9.0 * loopP;
+        const ryMax = 4.7 * loopP;
+        const cx = BX + side * (10.2 * loopP) + tailSway * 0.14;
+        const cy = BY - 0.8 + wy * 0.16;
+        const [c0, c1, r0, r1] = vBoxToGrid(cx - rxMax - 1, cy - ryMax - 1, cx + rxMax + 1, cy + ryMax + 1);
+
+        for (let r = r0; r <= r1; r++) {
+          const y = (r * CH + halfCH - originY) / pxPerUnit;
+          const dy = y - cy;
+          for (let c = c0; c <= c1; c++) {
+            const x = (c * CW + halfCW - originX) / pxPerUnit;
+            const dx = x - cx;
+            const pinch = 1 - 0.34 * Math.max(0, -side * (dx / (rxMax + 0.01)));
+            const q = (dx / rxMax) ** 2 + (dy / (ryMax * pinch)) ** 2;
+            if (q > 1) continue;
+
+            const innerPocket = q < 0.44 && dy > -0.65;
+            const specularBand = !innerPocket && dy < -0.55 && q > 0.34 && q < 0.88;
+            const lum = innerPocket
+              ? clamp(rl - 28 + q * 18, 10, 34)
+              : clamp(rl + (specularBand ? 26 : 5) - dy * 3.4 - (side > 0 ? 4 : 0), 26, 94);
+            const ch = innerPocket ? (q < 0.18 ? '.' : ':') : specularBand ? '=' : q > 0.85 ? 'o' : '#';
+            setCell(c, r, ch, hsl(rh + (specularBand ? 6 : 0), rs, lum));
+          }
+        }
+      }
+    }
+
+    // 4. Plump central satin knot (0.18 -> 0.48)
+    const knotP = easeOutBack(clamp((bowProg - 0.18) / 0.30, 0, 1));
+    if (knotP > 0.05) {
+      const krx = 2.8 * knotP, kry = 2.5 * knotP;
+      const [c0, c1, r0, r1] = vBoxToGrid(BX - krx - 1, BY - kry - 1, BX + krx + 1, BY + kry + 1);
+      for (let r = r0; r <= r1; r++) {
+        const y = (r * CH + halfCH - originY) / pxPerUnit;
+        const dy = y - (BY - 0.2);
+        for (let c = c0; c <= c1; c++) {
+          const x = (c * CW + halfCW - originX) / pxPerUnit;
+          const dx = x - BX;
+          const q = (dx / krx) ** 2 + (dy / kry) ** 2;
+          if (q > 1) continue;
+          const highlight = -(dx + dy) * 5.8;
+          const ch = q < 0.34 ? '@' : q < 0.72 ? '#' : 'o';
+          setCell(c, r, ch, hsl(rh + 4, rs + 6, clamp(rl + 10 + highlight, 28, 94)));
+        }
+      }
+    }
+  }
+
+  /* ============================================================================
+   * 7. BOUQUET COMPOSITION: 22 LAYERED FLOWERS + ABUNDANT BOTANICAL FOLIAGE
+   * ============================================================================ */
+  // 7 Roses, 4 Peonies, 3 Stargazer Lilies, 4 Gerbera Daisies, 4 Tulips = 22 Blooms
+  const FLOWERS = [
+    // Back upper crown & halo
+    { type: 'daisy', x: -29, y: 18, R:  8.0, z:  4, dir:  1, h:  14, s: 86, lShift:  0, phase: 0.7, delay: 3.82 },
+    { type: 'tulip', x:  29, y: 17, R:  8.8, z:  4, dir: -1, h:  46, s: 88, lShift:  0, tilt:  0.34, phase: 1.5, delay: 3.74 },
+    { type: 'lily',  x:   1, y: 12, R:  9.8, z:  5, dir:  1, h: 328, s: 84, lShift:  0, phase: 0.3, delay: 3.16 },
+    { type: 'peony', x: -15, y: 18, R:  9.8, z:  6, dir:  1, h: 340, s: 76, lShift: 10, phase: 1.1, delay: 2.94 },
+    { type: 'peony', x:  16, y: 18, R:  9.8, z:  6, dir: -1, h:  40, s: 52, lShift: 16, phase: 2.0, delay: 3.04 },
+    { type: 'tulip', x: -41, y: 29, R:  9.8, z:  7, dir:  1, h:  12, s: 88, lShift:  0, tilt: -0.54, phase: 2.4, delay: 3.90 },
+    { type: 'tulip', x:  41, y: 29, R:  9.8, z:  7, dir: -1, h: 324, s: 82, lShift:  0, tilt:  0.54, phase: 3.2, delay: 3.98 },
+
+    // Upper-mid roses & stargazer lilies
+    { type: 'rose',  x: -25, y: 31, R: 10.6, z:  9, dir: -1, h: 334, s: 78, lShift: 10, dew: true,  phase: 0.9, delay: 2.74 },
+    { type: 'rose',  x:  25, y: 31, R: 10.6, z:  9, dir:  1, h: 314, s: 56, lShift:  4, dew: false, phase: 1.8, delay: 2.82 },
+    { type: 'lily',  x: -33, y: 41, R: 10.8, z: 10, dir:  1, h: 332, s: 86, lShift:  0, phase: 2.7, delay: 3.34 },
+    { type: 'peony', x: -39, y: 53, R:  9.8, z: 11, dir:  1, h:   8, s: 82, lShift:  6, phase: 3.5, delay: 3.60 },
+    { type: 'lily',  x:  35, y: 42, R: 10.8, z: 12, dir: -1, h: 336, s: 86, lShift:  0, phase: 4.1, delay: 3.44 },
+
+    // Outer lower daisies
+    { type: 'daisy', x: -44, y: 64, R:  8.5, z: 13, dir:  1, h: 248, s: 72, lShift:  0, phase: 4.6, delay: 4.04 },
+    { type: 'daisy', x:  44, y: 64, R:  8.5, z: 13, dir: -1, h: 336, s: 76, lShift:  0, phase: 5.1, delay: 4.10 },
+
+    // Hero Center Crown Crimson Rose (opens first in the radial cascade!)
+    { type: 'rose',  x:   0, y: 28, R: 12.6, z: 14, dir:  1, h: 348, s: 88, lShift:  0, dew: true,  phase: 0.0, delay: 2.20 },
+
+    // Right lower-mid deep crimson rose
+    { type: 'rose',  x:  34, y: 58, R:  9.4, z: 15, dir: -1, h: 352, s: 88, lShift: -2, dew: false, phase: 3.8, delay: 3.66 },
+
+    // Mid-front lush roses (peach-coral & deep ruby)
+    { type: 'rose',  x: -16, y: 49, R: 11.4, z: 16, dir: -1, h:  14, s: 86, lShift:  5, dew: true,  phase: 2.2, delay: 2.38 },
+    { type: 'rose',  x:  16, y: 49, R: 11.4, z: 16, dir:  1, h: 342, s: 84, lShift: -4, dew: false, phase: 3.3, delay: 2.46 },
+
+    // Lower-front focal blooms (peony, warm gold daisy, champagne rose, rose tulip)
+    { type: 'peony', x: -24, y: 66, R:  9.2, z: 18, dir:  1, h: 346, s: 74, lShift:  9, phase: 5.4, delay: 3.24 },
+    { type: 'daisy', x:  24, y: 67, R:  8.8, z: 19, dir: -1, h:  44, s: 90, lShift:  0, phase: 5.9, delay: 3.40 },
+    { type: 'rose',  x:   0, y: 64, R: 10.6, z: 20, dir: -1, h:  38, s: 62, lShift: 14, dew: true,  phase: 1.3, delay: 2.64 },
+    { type: 'tulip', x: -11, y: 71, R:  8.4, z: 21, dir:  1, h: 344, s: 82, lShift:  0, tilt: -0.24, phase: 4.8, delay: 4.12 }
+  ];
+
+  // 4 Feathered Fern Fronds
+  const FERNS = [
+    { x: -55, y: 40, phase: 0.5 },
+    { x:  55, y: 40, phase: 1.7 },
+    { x: -46, y: 17, phase: 2.6 },
+    { x:  46, y: 17, phase: 3.5 }
+  ];
+
+  // 6 Tall Multi-Tiered Lavender Spikes
+  const LAVENDERS = [
+    { x: -51, y: 54, phase: 0.9 },
+    { x:  51, y: 54, phase: 2.1 },
+    { x: -35, y: 11, phase: 1.5 },
+    { x:  35, y: 11, phase: 3.4 },
+    { x: -15, y:  4, phase: 2.8 },
+    { x:  15, y:  4, phase: 4.5 }
+  ];
+
+  // 5 Silver-Dollar Eucalyptus Branches
+  const EUCALYPTUS = [
+    { x: -49, y: 62, phase: 1.1 },
+    { x:  49, y: 62, phase: 2.9 },
+    { x: -27, y: 20, phase: 0.4 },
+    { x:  27, y: 20, phase: 4.2 },
+    { x:   0, y:  6, phase: 5.5 }
+  ];
+
+  // 14 Baby's Breath (Schleierkraut) starry clouds nestled throughout the bouquet
+  const BABYS_BREATH = [
+    { x: -31, y: 37, fg: false }, { x:  31, y: 37, fg: false },
+    { x: -20, y: 23, fg: false }, { x:  20, y: 23, fg: false },
+    { x:   0, y: 19, fg: false }, { x: -42, y: 55, fg: false },
+    { x:  42, y: 55, fg: false }, { x: -10, y: 38, fg: true },
+    { x:  10, y: 38, fg: true },  { x: -21, y: 58, fg: true },
+    { x:  21, y: 58, fg: true },  { x:   0, y: 51, fg: true },
+    { x: -33, y: 64, fg: true },  { x:  33, y: 64, fg: true }
+  ].map((s, idx) => {
+    const nodes = [];
+    for (let k = 0; k < 6; k++) {
+      const ang = (k / 6) * Math.PI * 2 + idx * 0.7;
+      const dist = 2.5 + ((idx * 7 + k * 13) % 5) * 0.92;
+      nodes.push({ dx: Math.cos(ang) * dist, dy: Math.sin(ang) * dist * 0.85 });
+    }
+    return { ...s, phase: idx * 0.85, nodes };
+  });
+
+  // Fullscreen Cosmic Field: Multi-hue Stars, Stardust, Fireflies & Drifting Rose Petals
+  let STARS = [];
+  let FIREFLIES = [];
+  let DRIFT_PETALS = [];
+
+  function rebuildCosmos() {
+    const spanX = vMaxX - vMinX;
+    const spanY = vMaxY - vMinY;
+
+    // 145 twinkling multi-hue stars & stardust across 100% of screen
+    STARS = Array.from({ length: 145 }, (_, i) => ({
+      x: vMinX + ((i * 73.137) % 1) * spanX,
+      y: vMinY + ((i * 31.618) % 1) * spanY,
+      tier: i % 13 === 0 ? 2 : i % 3 === 0 ? 1 : 0,
+      hue: i % 5 === 0 ? 44 : i % 4 === 0 ? 326 : i % 3 === 0 ? 215 : 272,
+      phase: i * 1.37
+    }));
+
+    // 52 warm golden & rose fireflies gently drifting across the entire viewport
+    FIREFLIES = Array.from({ length: 52 }, (_, i) => ({
+      bx: vMinX + ((i * 41.73) % 1) * spanX,
+      by: vMinY + ((i * 23.41) % 1) * spanY,
+      ax: 5.5 + (i % 7) * 2.2,
+      ay: 4.5 + (i % 5) * 2.0,
+      fx: 0.21 + (i % 6) * 0.055,
+      fy: 0.17 + (i % 5) * 0.05,
+      phase: i * 0.91,
+      gold: i % 2 === 0
+    }));
+
+    // 26 falling rose petals drifting edge-to-edge
+    DRIFT_PETALS = Array.from({ length: 26 }, (_, i) => ({
+      x: vMinX + ((i * 19.37) % 1) * spanX,
+      speed: 0.020 + (i % 7) * 0.0036,
+      phase: (i * 0.417) % 1,
+      hue: i % 3 === 0 ? 348 : i % 3 === 1 ? 336 : 14,
+      size: i % 2
+    }));
+  }
+
+  /* ============================================================================
+   * 8. CHOREOGRAPHED 5.5-SECOND STARTUP ANIMATION & LIVING LOOP
+   * ============================================================================ */
+  function renderFrame(now) {
+    gTime = now * 0.001;
+    const tAnim = (now - animStartMs) * 0.001;
+
+    // Choreographed phase progress (0 -> 1)
+    const skyAwaken   = smoothstep(tAnim / 1.2);                     // 0.0s - 1.2s: starry cosmos & moonlight halo
+    const paperUnfold = smoothstep((tAnim - 0.60) / 1.65);           // 0.6s - 2.25s: kraft cone unfurls upward
+    const stemGrow    = smoothstep((tAnim - 0.65) / 1.65);           // 0.65s - 2.3s: curved Bezier stems grow
+    const leafUnfurl  = smoothstep((tAnim - 1.15) / 1.25);           // 1.15s - 2.4s: rose leaves unfold
+    const tissueBloom = smoothstep((tAnim - 1.35) / 1.15);           // 1.35s - 2.5s: silk tissue fans out
+    const greenBloom  = smoothstep((tAnim - 1.60) / 1.75);           // 1.6s - 3.35s: ferns, eucalyptus, lavender, Schleierkraut
+    const bowProg     = clamp((tAnim - 1.75) / 1.65, 0, 1);          // 1.75s - 3.4s: satin ribbon ties bow & tails unroll
+
+    // 0.0s - 1.7s: Golden stardust rising organically from the bottom center
+    if (tAnim < 1.75 && Math.random() < 0.78) {
+      spawnSparkle(
+        BX + (Math.random() - 0.5) * 20,
+        CONE_BOT - Math.random() * 14,
+        (Math.random() - 0.5) * 0.46,
+        -0.55 - Math.random() * 0.78,
+        44 + Math.random() * 10,
+        false,
+        0.95 + Math.random() * 0.52
+      );
+    }
+
+    // Smoothly decay pointer breeze velocity & influence
+    pointer.strength *= pointer.active ? 0.94 : 0.90;
+    pointer.vx *= 0.84;
+    pointer.vy *= 0.84;
+
+    // Clear ASCII character grid
+    chBuf.fill(null);
+
+    // ------------------------------------------------------------------------
+    // A. Fullscreen Twinkling Stars & Subtle Constellation Stardust
+    // ------------------------------------------------------------------------
+    if (skyAwaken > 0.01) {
+      for (let i = 0; i < STARS.length; i++) {
+        const s = STARS[i];
+        const tw = 0.5 + 0.5 * Math.sin(gTime * (1.5 + s.tier * 0.75) + s.phase);
+        const lum = clamp((24 + tw * (32 + s.tier * 18)) * skyAwaken, 8, 94);
+        const ch = s.tier === 2 ? (tw > 0.52 ? '*' : '+') : s.tier === 1 ? (tw > 0.60 ? '+' : '.') : '.';
+        P(s.x, s.y, ch, hsl(s.hue, 46, lum));
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // B. Back Foliage (Ferns, Lavender, Eucalyptus, Rear Pleated Silk Tissue)
+    // ------------------------------------------------------------------------
+    if (stemGrow > 0.02) {
+      for (const f of FERNS) {
+        drawFernFrond(f.x, f.y, f.phase, stemGrow, greenBloom);
+      }
+      for (const l of LAVENDERS) {
+        drawLavender(l.x, l.y, l.phase, stemGrow, greenBloom);
+      }
+      for (const e of EUCALYPTUS) {
+        drawEucalyptus(e.x, e.y, e.phase, stemGrow, greenBloom);
+      }
+    }
+
+    drawBackTissue(tissueBloom);
+
+    // Update live flower coordinates, radial staggered blooming (2.2s - 5.2s) & pollen bursts
+    for (let i = 0; i < FLOWERS.length; i++) {
+      const f = FLOWERS[i];
+      const [wx, wy] = getWindOffset(f.x, f.y, f.phase);
+      f.hx = f.x + wx;
+      f.hy = f.y + wy;
+
+      const budT = smoothstep((tAnim - (f.delay - 0.52)) / 0.52);
+      const openT = clamp((tAnim - f.delay) / 1.08, 0, 1);
+      const breath = 1 + Math.sin(gTime * 0.86 + f.phase) * 0.024 * openT;
+
+      f.open = smoothstep(openT);
+      f.scale = (budT * 0.24 + easeOutBack(openT) * 0.76) * breath;
+
+      if (openT > 0.32 && !f.burstDone) {
+        f.burstDone = true;
+        spawnSparkleBurst(f.hx, f.hy, f.h, 9);
+      }
+    }
+
+    // Flower stems & detailed veined rose leaves
+    if (stemGrow > 0.02) {
+      for (let i = 0; i < FLOWERS.length; i++) {
+        const f = FLOWERS[i];
+        const stemTopY = f.hy + f.R * 0.42;
+        drawStem(f.hx, stemTopY, stemGrow, 138, 52, 22, true, 0.20);
+
+        if (leafUnfurl > 0.04) {
+          for (let j = 0; j < 2; j++) {
+            const u = j === 0 ? 0.38 : 0.62;
+            if (stemGrow < u) continue;
+            const [lx, ly] = bezierStem(f.hx, stemTopY, u, 0.20);
+            const side = (i + j) % 2 ? 1 : -1;
+            const ang = (side > 0 ? -0.52 : -2.62) + Math.sin(gTime + f.phase) * 0.06;
+            drawRoseLeaf(lx, ly, ang, 10.2 * leafUnfurl, 2.7 * leafUnfurl, 136 + j * 7, 52);
+          }
+        }
+      }
+
+      // Collar of large veined rose leaves framing the wrapping cuff
+      if (leafUnfurl > 0.04) {
+        const collarLeaves = [
+          [-2.62, -13, 21], [-2.22, -7, 19], [-1.74, -2, 16],
+          [-1.40,   2, 16], [-0.92,  7, 19], [-0.52, 13, 21]
+        ];
+        for (let i = 0; i < collarLeaves.length; i++) {
+          const [ang, ox, len] = collarLeaves[i];
+          drawRoseLeaf(
+            BX + ox,
+            75,
+            ang + Math.sin(gTime * 0.8 + i) * 0.05,
+            len * leafUnfurl,
+            4.3 * leafUnfurl,
+            136 + (i % 3) * 4,
+            52
+          );
+        }
+      }
+    }
+
+    // Background Baby's Breath clouds
+    for (const s of BABYS_BREATH) {
+      if (!s.fg) drawBabysBreath(s, greenBloom);
+    }
+
+    // ------------------------------------------------------------------------
+    // C. All 22 Ultra-Detailed Flowers (Layered Back-to-Front by z-order)
+    // ------------------------------------------------------------------------
+    for (let i = 0; i < FLOWERS.length; i++) {
+      const f = FLOWERS[i];
+      if (f.scale <= 0.06) continue;
+      if (f.type === 'rose') drawRose(f);
+      else if (f.type === 'peony') drawPeony(f);
+      else if (f.type === 'lily') drawStargazerLily(f);
+      else if (f.type === 'daisy') drawDaisy(f);
+      else drawTulip(f);
+    }
+
+    // Foreground Baby's Breath tucked delicately between blossoms
+    for (const s of BABYS_BREATH) {
+      if (s.fg) drawBabysBreath(s, greenBloom);
+    }
+
+    // ------------------------------------------------------------------------
+    // D. Hand-Folded Kraft Wrapping Cone & Sculpted 3D Satin Bow
+    // ------------------------------------------------------------------------
+    drawWrappingPaper(paperUnfold, tissueBloom);
+    drawSatinRibbon(bowProg);
+
+    // ------------------------------------------------------------------------
+    // E. Fullscreen Fireflies, Drifting Rose Petals & Dynamic Sparkles
+    // ------------------------------------------------------------------------
+    if (skyAwaken > 0.15) {
+      for (let i = 0; i < FIREFLIES.length; i++) {
+        const q = FIREFLIES[i];
+        const x = q.bx + Math.sin(gTime * q.fx + q.phase) * q.ax;
+        const y = q.by + Math.cos(gTime * q.fy + q.phase * 1.3) * q.ay;
+        const tw = 0.5 + 0.5 * Math.sin(gTime * 3.0 + i * 1.7);
+        const ch = tw > 0.72 ? '*' : tw > 0.42 ? '+' : '.';
+        const hue = q.gold ? 45 : 344;
+        P(x, y, ch, hsl(hue, 94, clamp((46 + tw * 46) * skyAwaken, 14, 94)));
+      }
+    }
+
+    if (tAnim > 2.0) {
+      const driftFade = smoothstep((tAnim - 2.0) / 1.6);
+      const spanY = vMaxY - vMinY;
+      for (let i = 0; i < DRIFT_PETALS.length; i++) {
+        const p = DRIFT_PETALS[i];
+        const y = vMinY + ((gTime * p.speed + p.phase) % 1) * spanY;
+        const x = p.x + Math.sin(gTime * 1.15 + i * 2.1) * 5.4;
+        const ch = Math.sin(gTime * 2.2 + i) > 0 ? '~' : (p.size ? 'o' : ',');
+        P(x, y, ch, hsl(p.hue, 84, 46 + 30 * driftFade));
+      }
+    }
+
+    // Update & draw stardust, bloom-burst pollen, and touch-trail sparkles
+    for (let i = sparkles.length - 1; i >= 0; i--) {
+      const pt = sparkles[i];
+      pt.x += pt.vx + (pt.isPetal ? Math.sin(gTime * 3.0 + pt.wobble) * 0.08 : 0);
+      pt.y += pt.vy;
+      pt.vx *= 0.968;
+      pt.vy = pt.vy * 0.968 + pt.gravity;
+      pt.life -= pt.decay;
+      if (pt.life <= 0) {
+        sparkles.splice(i, 1);
+        continue;
+      }
+      const ratio = pt.life / pt.maxLife;
+      const ch = ratio > 0.62 ? pt.ch : ratio > 0.30 ? '+' : '.';
+      P(pt.x, pt.y, ch, hsl(pt.hue, 94, clamp(38 + ratio * 56, 24, 96)));
+    }
+
+    // ------------------------------------------------------------------------
+    // F. Composite Deep Midnight-Plum Sky + Batched Crisp ASCII + Soft Bloom
+    // ------------------------------------------------------------------------
+    // 1. Fullscreen midnight-plum radial gradient (#120726 center -> #05020d edges)
+    const bgGrad = ctx.createRadialGradient(
+      originX, originY + 46 * pxPerUnit, 10,
+      originX, originY + 56 * pxPerUnit, Math.max(vw, vh) * 0.78
+    );
+    bgGrad.addColorStop(0, '#120726');
+    bgGrad.addColorStop(0.58, '#090416');
+    bgGrad.addColorStop(1, '#05020d');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, vw, vh);
+
+    // 2. Soft breathing luminous moonlight / nebula halo behind the bouquet
+    if (skyAwaken > 0.01) {
+      ctx.save();
+      const auraPulse = 0.92 + 0.08 * Math.sin(gTime * 0.7);
+      ctx.globalAlpha = skyAwaken * auraPulse;
+      const auraR = Math.max(180, 82 * pxPerUnit);
+      const aura = ctx.createRadialGradient(
+        originX, originY + 42 * pxPerUnit, 8,
+        originX, originY + 46 * pxPerUnit, auraR
+      );
+      aura.addColorStop(0, 'rgba(235, 76, 146, 0.17)');
+      aura.addColorStop(0.46, 'rgba(176, 98, 220, 0.08)');
+      aura.addColorStop(0.75, 'rgba(255, 198, 120, 0.04)');
+      aura.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = aura;
+      ctx.fillRect(0, 0, vw, vh);
+      ctx.restore();
+    }
+
+    // 3. Color-bucketed crisp ASCII rendering pass (ultra-fast batched fillStyle)
+    actx.clearRect(0, 0, vw, vh);
+    for (let i = 0; i < N; i++) {
+      const c = chBuf[i];
+      if (!c) continue;
+      const col = colBuf[i];
+      let bucket = colorBuckets.get(col);
+      if (!bucket) {
+        bucket = [];
+        colorBuckets.set(col, bucket);
+      }
+      if (bucket.length === 0) activeColors.push(col);
+      bucket.push(i);
+    }
+
+    for (let b = 0; b < activeColors.length; b++) {
+      const col = activeColors[b];
+      const bucket = colorBuckets.get(col);
+      actx.fillStyle = col;
+      for (let k = 0; k < bucket.length; k++) {
+        const idx = bucket[k];
+        actx.fillText(chBuf[idx], (idx % W) * CW + halfCW, ((idx / W) | 0) * CH + halfCH);
+      }
+      bucket.length = 0;
+    }
+    activeColors.length = 0;
+
+    // 4. Subtle downscaled bloom pass so dewdrops, bright petal rims, anthers & stars gently glow
+    bctx.clearRect(0, 0, bloomCv.width, bloomCv.height);
+    bctx.save();
+    if ('filter' in bctx) {
+      bctx.filter = 'blur(4px) brightness(1.30)';
+    }
+    bctx.drawImage(asciiCv, 0, 0, bloomCv.width, bloomCv.height);
+    bctx.restore();
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.38;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(bloomCv, 0, 0, vw, vh);
+    ctx.restore();
+
+    // 5. Crisp foreground ASCII glyphs drawn cleanly over bloom
+    ctx.drawImage(asciiCv, 0, 0, vw, vh);
+
+    requestAnimationFrame(renderFrame);
+  }
+
+  /* ============================================================================
+   * 9. SUBTLE, INVISIBLE POINTER & TOUCH INTERACTIVITY
+   * ============================================================================ */
+  function handlePointer(clientX, clientY, isTapBurst = false) {
+    const nx = (clientX - originX) / pxPerUnit;
+    const ny = (clientY - originY) / pxPerUnit;
+    const moveX = clamp(nx - pointer.x, -8, 8);
+    const moveY = clamp(ny - pointer.y, -8, 8);
+
+    pointer.vx = pointer.vx * 0.45 + moveX * 0.55;
+    pointer.vy = pointer.vy * 0.45 + moveY * 0.55;
+    pointer.x = nx;
+    pointer.y = ny;
+    pointer.active = true;
+    pointer.strength = Math.min(1, pointer.strength + 0.38);
+
+    if (isTapBurst) {
+      spawnSparkleBurst(nx, ny, 344, 14);
+    } else if (Math.hypot(moveX, moveY) > 0.30) {
+      const count = 2 + (Math.random() > 0.55 ? 1 : 0);
+      for (let i = 0; i < count; i++) {
+        const isPetal = Math.random() < 0.28;
+        spawnSparkle(
+          nx + (Math.random() - 0.5) * 3.0,
+          ny + (Math.random() - 0.5) * 3.0,
+          moveX * 0.14 + (Math.random() - 0.5) * 0.55,
+          moveY * 0.14 + (isPetal ? 0.12 : -0.18) + (Math.random() - 0.5) * 0.42,
+          isPetal ? 344 : 46,
+          isPetal,
+          0.75 + Math.random() * 0.45
+        );
+      }
+    }
+  }
+
+  canvas.addEventListener('pointermove', (e) => handlePointer(e.clientX, e.clientY, false));
+  canvas.addEventListener('pointerdown', (e) => handlePointer(e.clientX, e.clientY, true));
+  canvas.addEventListener('pointerup', () => { pointer.active = false; });
+  canvas.addEventListener('pointerleave', () => { pointer.active = false; });
+
+  // Smooth debounced resize & orientation change support for iPhone, iPad & Desktop
+  let resizeTimer = null;
+  function onViewportChange() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resizeEngine, 70);
+  }
+  window.addEventListener('resize', onViewportChange);
+  window.addEventListener('orientationchange', onViewportChange);
+
+  // Start immediately on window load
+  window.addEventListener('load', () => {
+    resizeEngine();
+    animStartMs = performance.now();
+    requestAnimationFrame(renderFrame);
+  });
+})();
+</script>
+</body>
+</html>
